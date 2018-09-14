@@ -3,185 +3,187 @@ import torch.nn.functional as F
 
 import random
 
+
 class DSAC:
-	'''
-	Differentiable RANSAC to robustly fit lines.
-	'''
+    """
+    Differentiable RANSAC to robustly fit lines.
+    """
 
-	def __init__(self, hyps, inlier_thresh, inlier_beta, inlier_alpha, loss_function):
-		'''
-		Constructor.
+    def __init__(self, hyps, inlier_thresh, inlier_beta, inlier_alpha, loss_function):
+        """
+        Constructor.
+        :param hyps: number of line hypotheses sampled for each image
+        :param inlier_thresh: threshold used in the soft inlier count, its measured in relative image size (1 = image width)
+        :param inlier_beta: scaling factor within the sigmoid of the soft inlier count
+        :param inlier_alpha: scaling factor for the soft inlier scores (controls the peakiness of the hypothesis distribution)
+        :param loss_function: function to compute the quality of estimated line parameters wrt ground truth
+        """
 
-		hyps -- number of line hypotheses sampled for each image
-		inlier_thresh -- threshold used in the soft inlier count, its measured in relative image size (1 = image width)
-		inlier_beta -- scaling factor within the sigmoid of the soft inlier count
-		inlier_alpha -- scaling factor for the soft inlier scores (controls the peakiness of the hypothesis distribution)
-		loss_function -- function to compute the quality of estimated line parameters wrt ground truth
-		'''
+        self.hyps = hyps
+        self.inlier_thresh = inlier_thresh
+        self.inlier_beta = inlier_beta
+        self.inlier_alpha = inlier_alpha
+        self.loss_function = loss_function
 
-		self.hyps = hyps
-		self.inlier_thresh = inlier_thresh
-		self.inlier_beta = inlier_beta
-		self.inlier_alpha = inlier_alpha
-		self.loss_function = loss_function
+    def __sample_hyp(self, x, y):
+        """
+        Calculate a line hypothesis (slope, intercept) from two random points.
+        :param x: vector of x values
+        :param y: vector of y values
+        :return:
+        """
 
-	def __sample_hyp(self, x, y):
-		'''
-		Calculate a line hypothesis (slope, intercept) from two random points.
+        # select two random points
+        num_correspondences = x.size(0)
 
-		x -- vector of x values
-		y -- vector of y values
-		'''
+        idx1 = random.randint(0, num_correspondences - 1)
+        idx2 = random.randint(0, num_correspondences - 1)
 
-		# select two random points
-		num_correspondences = x.size(0)
+        tries = 1000
 
-		idx1 = random.randint(0, num_correspondences-1)
-		idx2 = random.randint(0, num_correspondences-1)
+        # prevent slope from getting too large
+        while torch.abs(x[idx1] - x[idx2]) < 0.01 and tries > 0:
+            idx2 = random.randint(0, num_correspondences - 1)
+            tries = tries - 1
 
-		tries = 1000
+        if tries == 0: return 0, 0, False  # no valid hypothesis found, indicated by False
 
-		# prevent slope from getting too large
-		while torch.abs(x[idx1] - x[idx2]) < 0.01 and tries > 0:
-			idx2 = random.randint(0, num_correspondences-1)
-			tries = tries - 1
+        slope = (y[idx1] - y[idx2]) / (x[idx1] - x[idx2])
+        intercept = y[idx1] - slope * x[idx1]
 
-		if tries == 0: return 0, 0, False # no valid hypothesis found, indicated by False
+        return slope, intercept, True  # True indicates success
 
-		slope = (y[idx1] - y[idx2]) / (x[idx1] - x[idx2])
-		intercept = y[idx1] - slope * x[idx1]
+    def __soft_inlier_count(self, slope, intercept, x, y):
+        """
+        Soft inlier count for a given line and a given set of points.
 
-		return slope, intercept, True # True indicates success
+        :param slope: slope of the line
+        :param intercept: intercept of the line
+        :param x: vector of x values
+        :param y: vector of y values
+        :return:
+        """
+        # point line distances
+        dists = torch.abs(slope * x - y + intercept)
+        dists = dists / torch.sqrt(slope * slope + 1)
 
-	def __soft_inlier_count(self, slope, intercept, x, y):
-		'''
-		Soft inlier count for a given line and a given set of points.
+        # soft inliers
+        dists = 1 - torch.sigmoid(self.inlier_beta * (dists - self.inlier_thresh))
+        score = torch.sum(dists)
 
-		slope -- slope of the line
-		intercept -- intercept of the line
-		x -- vector of x values
-		y -- vector of y values
-		'''
+        return score, dists
 
-		# point line distances
-		dists = torch.abs(slope * x - y + intercept)
-		dists = dists / torch.sqrt(slope * slope + 1)
+    def __refine_hyp(self, x, y, weights):
+        """
+        Refinement by weighted Deming regression.
 
-		# soft inliers
-		dists = 1 - torch.sigmoid(self.inlier_beta * (dists - self.inlier_thresh)) 
-		score = torch.sum(dists)
+        Fits a line minimizing errors in x and y, implementation according to:
+            'Performance of Deming regression analysis in case of misspecified
+            analytical error ratio in method comparison studies'
+            Kristian Linnet, in Clinical Chemistry, 1998
+        :param x: vector of x values
+        :param y: vector of y values
+        :param weights: vector of weights (1 per points)
+        :return:
+        """
+        ws = weights.sum()
+        xm = (x * weights).sum() / ws
+        ym = (y * weights).sum() / ws
 
-		return score, dists
+        u = (x - xm) ** 2
+        u = (u * weights).sum()
 
-	def __refine_hyp(self, x, y, weights):
-		'''
-		Refinement by weighted Deming regression.
+        q = (y - ym) ** 2
+        q = (q * weights).sum()
 
-		Fits a line minimizing errors in x and y, implementation according to: 
-			'Performance of Deming regression analysis in case of misspecified 
-			analytical error ratio in method comparison studies'
-			Kristian Linnet, in Clinical Chemistry, 1998
+        p = torch.mul(x - xm, y - ym)
+        p = (p * weights).sum()
 
-		x -- vector of x values
-		y -- vector of y values
-		weights -- vector of weights (1 per point)		
-		'''
+        slope = (q - u + torch.sqrt((u - q) ** 2 + 4 * p * p)) / (2 * p)
+        intercept = ym - slope * xm
 
-		ws = weights.sum()
-		xm = (x * weights).sum() / ws
-		ym = (y * weights).sum() / ws
+        return slope, intercept
 
-		u = (x - xm)**2
-		u = (u * weights).sum()
+    def __call__(self, prediction, labels):
+        """
 
-		q = (y - ym)**2
-		q = (q * weights).sum()
+        Perform robust, differentiable line fitting according to DSAC.
 
-		p = torch.mul(x - xm, y - ym)
-		p = (p * weights).sum()
+        Returns the expected loss of choosing a good line hypothesis which can be used for backprob.
 
-		slope = (q - u + torch.sqrt((u - q)**2 + 4*p*p)) / (2*p)
-		intercept = ym - slope * xm
+        prediction -- predicted 2D points for a batch of images, array of shape (Bx2) where
+            B is the number of images in the batch
+            2 is the number of point dimensions (y, x)
+        :param prediction: predicted 2D points for a batch of images, array of shape (Bx2) where
+            B is the number of images in the batch
+            2 is the number of point dimensions (y, x)
+        :param labels: ground truth labels for the batch, array of shape (Bx2) where
+            B is the number of images in the batch
+            2 is the number of parameters (intercept, slope)
+        :return:
+        """
+        # working on CPU because of many, small matrices
+        prediction = prediction.cpu()
 
-		return slope, intercept
-		
+        batch_size = prediction.size(0)
 
-	def __call__(self, prediction, labels):
-		'''
-		Perform robust, differentiable line fitting according to DSAC.
+        avg_exp_loss = 0  # expected loss
+        avg_top_loss = 0  # loss of best hypothesis
 
-		Returns the expected loss of choosing a good line hypothesis which can be used for backprob.
+        self.est_parameters = torch.zeros(batch_size, 2)  # estimated lines
+        self.est_losses = torch.zeros(batch_size)  # loss of estimated lines
+        self.batch_inliers = torch.zeros(batch_size, prediction.size(2))  # (soft) inliers for estimated lines
 
-		prediction -- predicted 2D points for a batch of images, array of shape (Bx2) where
-			B is the number of images in the batch
-			2 is the number of point dimensions (y, x)
-		labels -- ground truth labels for the batch, array of shape (Bx2) where
-			B is the number of images in the batch
-			2 is the number of parameters (intercept, slope)
-		'''
+        for b in range(0, batch_size):
 
-		# working on CPU because of many, small matrices
-		prediction = prediction.cpu()
+            hyp_losses = torch.zeros([self.hyps, 1])  # loss of each hypothesis
+            hyp_scores = torch.zeros([self.hyps, 1])  # score of each hypothesis
 
-		batch_size = prediction.size(0)
+            max_score = 0  # score of best hypothesis
 
-		avg_exp_loss = 0 # expected loss
-		avg_top_loss = 0 # loss of best hypothesis
+            y = prediction[b, 0]  # all y-values of the prediction
+            x = prediction[b, 1]  # all x.values of the prediction
 
-		self.est_parameters = torch.zeros(batch_size, 2) # estimated lines
-		self.est_losses = torch.zeros(batch_size) # loss of estimated lines
-		self.batch_inliers = torch.zeros(batch_size, prediction.size(2)) # (soft) inliers for estimated lines
+            for h in range(0, self.hyps):
 
-		for b in range(0, batch_size):
+                # === step 1: sample hypothesis ===========================
+                slope, intercept, valid = self.__sample_hyp(x, y)
+                if not valid: continue  # skip invalid hyps
 
-			hyp_losses = torch.zeros([self.hyps, 1]) # loss of each hypothesis
-			hyp_scores = torch.zeros([self.hyps, 1]) # score of each hypothesis
+                # === step 2: score hypothesis using soft inlier count ====
+                score, inliers = self.__soft_inlier_count(slope, intercept, x, y)
 
-			max_score = 0 	# score of best hypothesis
+                # === step 3: refine hypothesis ===========================
+                slope, intercept = self.__refine_hyp(x, y, inliers)
 
-			y = prediction[b, 0] # all y-values of the prediction
-			x = prediction[b, 1] # all x.values of the prediction
+                hyp = torch.zeros([2])
+                hyp[1] = slope
+                hyp[0] = intercept
 
-			for h in range(0, self.hyps):	
+                # === step 4: calculate loss of hypothesis ================
+                loss = self.loss_function(hyp, labels[b])
 
-				# === step 1: sample hypothesis ===========================
-				slope, intercept, valid = self.__sample_hyp(x, y)
-				if not valid: continue # skip invalid hyps
+                # store results
+                hyp_losses[h] = loss
+                hyp_scores[h] = score
 
-				# === step 2: score hypothesis using soft inlier count ====
-				score, inliers = self.__soft_inlier_count(slope, intercept, x, y)
+                # keep track of best hypothesis so far
+                if score > max_score:
+                    max_score = score
+                    self.est_losses[b] = loss
+                    self.est_parameters[b] = hyp
+                    self.batch_inliers[b] = inliers
 
-				# === step 3: refine hypothesis ===========================
-				slope, intercept = self.__refine_hyp(x, y, inliers)
+            # === step 5: calculate the expectation ===========================
 
-				hyp = torch.zeros([2])
-				hyp[1] = slope
-				hyp[0] = intercept
+            # softmax distribution from hypotheses scores
+            hyp_scores = F.softmax(self.inlier_alpha * hyp_scores, 0)
 
-				# === step 4: calculate loss of hypothesis ================
-				loss = self.loss_function(hyp, labels[b]) 
+            # expectation of loss
+            exp_loss = torch.sum(hyp_losses * hyp_scores)
+            avg_exp_loss = avg_exp_loss + exp_loss
 
-				# store results
-				hyp_losses[h] = loss
-				hyp_scores[h] = score
+            # loss of best hypothesis (for evaluation)
+            avg_top_loss = avg_top_loss + self.est_losses[b]
 
-				# keep track of best hypothesis so far
-				if score > max_score:
-					max_score = score
-					self.est_losses[b] = loss
-					self.est_parameters[b] = hyp
-					self.batch_inliers[b] = inliers
-
-			# === step 5: calculate the expectation ===========================
-
-			#softmax distribution from hypotheses scores			
-			hyp_scores = F.softmax(self.inlier_alpha * hyp_scores, 0)
-
-			# expectation of loss
-			exp_loss = torch.sum(hyp_losses * hyp_scores)
-			avg_exp_loss = avg_exp_loss + exp_loss
-
-			# loss of best hypothesis (for evaluation)
-			avg_top_loss = avg_top_loss + self.est_losses[b]
-	
-		return avg_exp_loss / batch_size, avg_top_loss / batch_size
+        return avg_exp_loss / batch_size, avg_top_loss / batch_size
